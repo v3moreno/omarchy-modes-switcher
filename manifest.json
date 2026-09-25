@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-modes.switcher",
+  "name": "Omarchy Modes Switcher",
+  "version": "1.0.0",
+  "author": "Victor Moreno",
+  "license": "MIT",
+  "description": "Per-workspace layout modes for Hyprland. Switch a workspace between floating, dwindle, master, and scrolling from the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "ModeSwitcher.qml"
+  },
+  "barWidget": {
+    "displayName": "Modes",
+    "description": "Shows and switches the active workspace layout mode.",
+    "category": "Desktop",
+    "allowMultiple": false,
+    "defaultSection": "left",
+    "defaults": {
+      "enableKeybinds": false
+    },
+    "schema": [
+      {
+        "key": "enableKeybinds",
+        "type": "boolean",
+        "label": "Enable mode keybinds",
+        "defaultValue": false
+      }
+    ]
+  }
+}
