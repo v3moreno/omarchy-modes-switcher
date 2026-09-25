@@ -2,8 +2,6 @@
 
 Per-workspace layout modes for Hyprland, switched from an Omarchy bar widget.
 
-![Preview Image](preview.png)
-
 Each workspace gets its own mode:
 
 - **Floating** — windows open floating and stay that way
