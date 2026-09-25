@@ -74,15 +74,15 @@ BarWidget {
   readonly property int snapDragTimeoutMs: 45000
   readonly property int snapDivergencePx: 60
   readonly property int snapDivergenceTicks: 3
-
-  readonly property var snapCandidateScreen: {
-    if (!snapCandidate || snapHoverMonitor === "") return null
-    var screens = Quickshell.screens.values()
-    for (var i = 0; i < screens.length; i += 1) {
-      if (screens[i] && String(screens[i].name) === snapHoverMonitor) return screens[i]
-    }
-    return null
-  }
+  // Snap settings persisted in snap-assist.json. columns: 0 = auto-detect from
+  // the monitor's aspect, else a fixed 2/3/4. rows: the per-column upper/lower
+  // half snaps on the top/bottom edges. reach: edge proximity preset index.
+  property int snapColumns: 0
+  property bool snapRows: true
+  property int snapReach: 1
+  property string snapExpanded: ""
+  readonly property var snapReachScales: [0.7, 1.0, 1.5]
+  readonly property real snapReachScale: snapReachScales[Math.max(0, Math.min(2, snapReach))]
 
   // This is a live mirror maintained by Quickshell's Hyprland IPC integration.
   // It changes on workspace events; no polling is involved.
@@ -147,12 +147,15 @@ BarWidget {
 
   function open() {
     if (applying) return
-    menuCursor = Math.max(0, modes.indexOf(currentMode))
+    snapExpanded = ""
+    // Item 0 is the LAYOUT header; modes follow it.
+    menuCursor = Math.max(0, modes.indexOf(currentMode)) + 1
     menuOpen = true
     opened = true
   }
 
   function close() {
+    snapExpanded = ""
     menuOpen = false
     opened = false
   }
@@ -489,6 +492,8 @@ BarWidget {
   }
 
   function snapDragStart() {
+    console.log("omarchy-modes.switcher: snapDragStart IPC (enabled=" + snapEnabled
+      + " loaded=" + snapLoaded + " dragging=" + snapDragging + ")")
     if (!snapLoaded || !snapEnabled) return "disabled"
     if (snapDragging || snapProcess.running) return "busy"
     snapDragging = true
@@ -499,21 +504,23 @@ BarWidget {
     snapDiverged = 0
     snapTimeout.restart()
     runSnap(["sh", "-c", "hyprctl cursorpos; echo ===; hyprctl -j clients; echo ===; hyprctl -j monitors"
-      + "; echo ===; hyprctl -j getoption general:gaps_in; echo ===; hyprctl -j getoption general:gaps_out"],
+      + "; echo ===; hyprctl -j getoption general:gaps_in; echo ===; hyprctl -j getoption general:gaps_out"
+      + "; echo ===; hyprctl -j activewindow"],
       "drag probe", onSnapProbe)
     return "probing"
   }
 
   function onSnapProbe(text) {
     var parts = String(text).split("\n===\n")
-    if (parts.length !== 5) { snapFail("drag probe: unexpected output"); return }
+    if (parts.length !== 6) { snapFail("drag probe: unexpected output"); return }
     var pos = parseCursorPos(parts[0])
-    var clients, monitors, gapsInOpt, gapsOutOpt
+    var clients, monitors, gapsInOpt, gapsOutOpt, activeWin
     try {
       clients = JSON.parse(parts[1])
       monitors = JSON.parse(parts[2])
       gapsInOpt = JSON.parse(parts[3])
       gapsOutOpt = JSON.parse(parts[4])
+      activeWin = JSON.parse(parts[5])
     } catch (error) {
       snapFail("drag probe did not return JSON: " + error.message)
       return
@@ -533,19 +540,45 @@ BarWidget {
       var m = monitors[i]
       if (m && m.name) {
         var area = Snap.workArea(m)
-        areas[String(m.name)] = { area: area, cols: Snap.columnsFor(area.width, area.height) }
+        areas[String(m.name)] = { area: area, cols: Snap.columnsFor(area.width, area.height, root.snapColumns) }
       }
       var aw = m && m.activeWorkspace
       if (aw) visible[String(aw.name || "")] = true
     }
     snapAreas = areas
-    snapWindow = windowAtCursor(clients, pos.x, pos.y, visible)
-    // The press must have landed on a real window — clicks on the bar,
-    // wallpaper, or empty workspace never arm a snap.
+    // The focused window is the dragged window in a real drag — prefer it.
+    // The probe runs ~200ms late, so the cursor may already hover a different
+    // window; hit-testing it would snap the wrong window. The hit-test only
+    // proves the press started on a window: over any window, or near the
+    // active window's rect (fast drags leave it behind). A SUPER+click on
+    // wallpaper far from the focused window still arms nothing.
+    var underCursor = windowAtCursor(clients, pos.x, pos.y, visible)
+    snapWindow = ""
+    if (activeWin && validAddress(activeWin.address)) {
+      var activeClient = null
+      for (var ai = 0; ai < clients.length; ai++) {
+        if (clients[ai] && clients[ai].address === activeWin.address) {
+          activeClient = clients[ai]
+          break
+        }
+      }
+      var near = false
+      if (activeClient && activeClient.at && activeClient.size) {
+        near = pos.x >= activeClient.at[0] - 600
+          && pos.x <= activeClient.at[0] + activeClient.size[0] + 600
+          && pos.y >= activeClient.at[1] - 600
+          && pos.y <= activeClient.at[1] + activeClient.size[1] + 600
+      }
+      if (underCursor !== "" || near) snapWindow = activeWin.address
+    }
+    if (snapWindow === "") snapWindow = underCursor
     if (!validAddress(snapWindow) || snapReleased) {
+      console.log("omarchy-modes.switcher: snap probe found no window at "
+        + pos.x + "," + pos.y + " (released=" + snapReleased + ")")
       resetSnapDrag()
       return
     }
+    console.log("omarchy-modes.switcher: snap drag armed on " + snapWindow)
     // Grab offset for the release-divergence failsafe: while a floating
     // window is dragged its position stays press-at - press-cursor.
     snapGrabX = 0
@@ -577,7 +610,8 @@ BarWidget {
       if (monitor && Snap.dragIsArmed(snapPressX, snapPressY, pos.x, pos.y)) {
         var meta = snapAreas[snapHoverMonitor]
         if (meta) {
-          snapCandidate = Snap.edgeCandidate(meta.area, meta.cols, pos.x, pos.y, snapGapsOut, snapGapsIn)
+          snapCandidate = Snap.edgeCandidate(meta.area, meta.cols, pos.x, pos.y, snapGapsOut, snapGapsIn,
+            { rows: root.snapRows, reach: root.snapReachScale })
         }
       }
       // Release failsafe: if the release bind never reaches us, the dragged
@@ -599,6 +633,8 @@ BarWidget {
   }
 
   function snapDragEnd() {
+    console.log("omarchy-modes.switcher: snapDragEnd IPC (dragging=" + snapDragging
+      + " candidate=" + JSON.stringify(snapCandidate) + ")")
     if (!snapDragging) return "ignored"
     // A release that lands while a probe/poll is still in flight is deferred —
     // the process exit handler re-invokes this once the pipe is free.
@@ -673,21 +709,41 @@ BarWidget {
     })
   }
 
+  function snapFilePayload() {
+    return JSON.stringify({
+      enabled: snapEnabled, columns: snapColumns, rows: snapRows, reach: snapReach
+    }) + "\n"
+  }
+
+  // snap-assist.json lives in stateDirectory, which a fresh profile may not
+  // have yet — ensure it exists first rather than failing the write silently.
+  function persistSnapFile() {
+    if (ensureDirectories.running) {
+      snapFile.setText(snapFilePayload())
+      return
+    }
+    snapPendingWrite = true
+    ensureDirectories.command = ["mkdir", "-p", stateDirectory, dropinDirectory]
+    ensureDirectories.running = true
+  }
+
   function loadSnapFile(text) {
     snapLoaded = true
-    var enabled = false
+    var parsed = null
     try {
-      var parsed = JSON.parse(text || "")
-      enabled = parsed && parsed.enabled === true
+      parsed = JSON.parse(text || "")
     } catch (error) {
-      enabled = false
+      parsed = null
     }
-    if (enabled !== snapEnabled) {
-      snapEnabled = enabled
-      // Reconcile regenerates the drop-in when the persisted flag differs
-      // from what the current file content was generated with.
-      reconcileDropin()
+    if (parsed) {
+      snapEnabled = parsed.enabled === true
+      snapColumns = parsed.columns === 2 || parsed.columns === 3 || parsed.columns === 4
+        ? parsed.columns : 0
+      snapRows = parsed.rows !== false
+      snapReach = parsed.reach === 0 || parsed.reach === 1 || parsed.reach === 2
+        ? parsed.reach : 1
     }
+    reconcileDropin()
   }
 
   function toggleSnapAssist() {
@@ -698,20 +754,114 @@ BarWidget {
     snapEnabled = !snapEnabled
     if (!snapEnabled && snapDragging) resetSnapDrag()
     reconcileDropin()
-    // snap-assist.json lives in stateDirectory, which a fresh profile may not
-    // have yet — ensure it exists first rather than failing the write silently.
-    if (ensureDirectories.running) {
-      snapFile.setText(JSON.stringify({ enabled: snapEnabled }) + "\n")
-      return "toggled"
-    }
-    snapPendingWrite = true
-    ensureDirectories.command = ["mkdir", "-p", stateDirectory, dropinDirectory]
-    ensureDirectories.running = true
+    persistSnapFile()
     return "toggled"
+  }
+
+  // "rows" is the only toggle besides enabled; "columns"/"reach" are options
+  // set through chooseSnapOption.
+  function toggleSnapSetting(id) {
+    if (id === "enabled") { toggleSnapAssist(); return }
+    if (id === "rows") { snapRows = !snapRows; persistSnapFile() }
+  }
+
+  function chooseSnapOption(item) {
+    if (item.opt === "columns") {
+      snapColumns = item.id === "auto" ? 0 : Number(item.id)
+    } else if (item.opt === "reach") {
+      snapReach = ({ near: 0, normal: 1, far: 2 })[item.id]
+      if (snapReach === undefined) snapReach = 1
+    }
+    snapExpanded = ""
+    persistSnapFile()
+    // Leave the cursor on the option row the choice belonged to.
+    for (var i = 0; i < menuModel.length; i++) {
+      if (menuModel[i].kind === "option" && menuModel[i].id === item.opt) {
+        menuCursor = i
+        break
+      }
+    }
   }
 
   function snapFileLoaded(text) {
     loadSnapFile(text)
+  }
+
+  // ---- menu model ----
+  // Aesthetic borrowed from sero.local-ai: one gutter, flat rows grouped under
+  // faint caps headers, a check for what is chosen, a chevron for what opens,
+  // values flush right. Rows in a group touch; groups sit a gap apart.
+  readonly property string menuFont: bar && bar.fontFamily ? bar.fontFamily : Style.font.family
+  readonly property color menuInk: Color.popups.text
+  readonly property color menuValue: Util.alpha(Color.popups.text, 0.72)
+  readonly property color menuLabel: Util.alpha(Color.popups.text, 0.48)
+  readonly property color menuSurface: Util.alpha(Color.popups.text, 0.07)
+  readonly property int menuGutter: Style.space(18)
+  readonly property int menuEdge: Style.space(8)
+  readonly property int menuSlot: Style.space(18)
+  readonly property int menuRowH: Style.space(24)
+  readonly property int menuHeadH: Style.space(14)
+  readonly property int menuGroupGap: Style.space(16)
+  readonly property int menuTopPad: Style.space(10)
+
+  function menuItems() {
+    var items = [{ kind: "sec", label: "LAYOUT" }]
+    for (var i = 0; i < modes.length; i++) {
+      items.push({
+        kind: "mode", id: modes[i], label: modeLabel(modes[i]),
+        glyph: modeGlyph(modes[i]),
+        checked: currentMode === modes[i],
+        value: currentMode === modes[i] ? "✓" : ""
+      })
+    }
+    items.push({ kind: "sec", label: "SNAP" })
+    items.push({ kind: "toggle", id: "enabled", label: "enabled",
+      value: snapEnabled ? "on" : "off" })
+    items.push({ kind: "option", id: "columns", label: "columns",
+      value: snapColumns === 0 ? "auto" : String(snapColumns) })
+    if (snapExpanded === "columns") {
+      var colChoices = ["auto", "2", "3", "4"]
+      for (var c = 0; c < colChoices.length; c++) {
+        items.push({ kind: "choice", opt: "columns", id: colChoices[c],
+          label: colChoices[c],
+          checked: snapColumns === (c === 0 ? 0 : Number(colChoices[c])) })
+      }
+    }
+    items.push({ kind: "toggle", id: "rows", label: "rows",
+      value: snapRows ? "on" : "off" })
+    var reachNames = ["near", "normal", "far"]
+    items.push({ kind: "option", id: "reach", label: "reach",
+      value: reachNames[snapReach] })
+    if (snapExpanded === "reach") {
+      for (var r = 0; r < reachNames.length; r++) {
+        items.push({ kind: "choice", opt: "reach", id: reachNames[r],
+          label: reachNames[r], checked: snapReach === r })
+      }
+    }
+    return items
+  }
+
+  readonly property var menuModel: menuItems()
+  onMenuModelChanged: menuCursor = Math.max(0, Math.min(menuModel.length - 1, menuCursor))
+
+  function moveMenuCursor(dy) {
+    var items = menuModel, i = menuCursor
+    for (;;) {
+      var next = i + dy
+      if (next < 0 || next >= items.length) break
+      i = next
+      if (items[i].kind !== "sec") break
+    }
+    menuCursor = i
+  }
+
+  function activateMenuItem() {
+    var item = menuModel[menuCursor]
+    if (!item || item.kind === "sec") return
+    if (item.kind === "mode") startApply(item.id)
+    else if (item.kind === "toggle") toggleSnapSetting(item.id)
+    else if (item.kind === "option") snapExpanded = snapExpanded === item.id ? "" : item.id
+    else if (item.kind === "choice") chooseSnapOption(item)
   }
 
   implicitWidth: triggerRow.implicitWidth
@@ -779,121 +929,110 @@ BarWidget {
     bar: root.bar
     open: root.menuOpen
     focusTarget: menuKeys
-    contentWidth: modeMenu.fittedContentWidth(Style.space(220))
+    contentWidth: modeMenu.fittedContentWidth(Style.space(230))
     contentHeight: modeMenu.fittedContentHeight(menuRows.implicitHeight)
 
     PanelKeyCatcher {
       id: menuKeys
       anchors.fill: parent
-      onMoveRequested: function(dx, dy) {
-        if (dy === 0) return
-        root.menuCursor = Math.max(0, Math.min(root.modes.length, root.menuCursor + dy))
+      onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveMenuCursor(dy) }
+      onActivateRequested: root.activateMenuItem()
+      onCloseRequested: {
+        if (root.snapExpanded !== "") root.snapExpanded = ""
+        else root.close()
       }
-      onActivateRequested: {
-        if (root.menuCursor < root.modes.length) root.startApply(root.modes[root.menuCursor])
-        else root.toggleSnapAssist()
-      }
-      onCloseRequested: root.close()
 
       Column {
         id: menuRows
         width: parent.width
-        spacing: Style.spacing.labelGap
+        spacing: 0
+        topPadding: root.menuTopPad
+        bottomPadding: root.menuTopPad
 
         Repeater {
-          model: root.modes
+          model: root.menuModel
 
-          Rectangle {
-            required property string modelData
+          Item {
+            required property var modelData
             required property int index
-            readonly property bool activeMode: root.currentMode === modelData
-            readonly property bool cursorMode: root.menuCursor === index
+            readonly property var item: modelData
+            readonly property bool isRow: item.kind !== "sec"
+            readonly property bool cursor: isRow && root.menuCursor === index
+            // A leading slot holds the mode glyph, or the check on choice rows.
+            readonly property bool hasSlot: item.kind === "mode" || item.kind === "choice"
             width: menuRows.width
-            height: Style.spacing.popupRowHeight
-            radius: Math.max(1, Style.cornerRadius - Style.spacing.hairline)
-            color: cursorMode
-              ? Style.hoverFillFor(Color.popups.text, Color.accent) : "transparent"
-            opacity: root.applying ? 0.55 : 1
+            height: isRow ? root.menuRowH
+              : (index === 0 ? root.menuTopPad : root.menuGroupGap) + root.menuHeadH
+            opacity: root.applying && item.kind === "mode" ? 0.55 : 1
+
+            // Section header ("LAYOUT", "SNAP") — sits on its group's rows.
+            Text {
+              visible: !parent.isRow
+              x: root.menuGutter
+              anchors.bottom: parent.bottom
+              text: parent.item.label
+              color: root.menuLabel
+              font.family: root.menuFont
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+
+            Rectangle {
+              visible: parent.isRow
+              x: root.menuEdge
+              width: parent.width - 2 * root.menuEdge
+              height: root.menuRowH
+              radius: 2
+              color: parent.cursor ? root.menuSurface : "transparent"
+            }
 
             Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.spacing.controlPaddingX
+              visible: parent.isRow && parent.hasSlot
+              x: root.menuGutter
               anchors.verticalCenter: parent.verticalCenter
-              text: parent.activeMode ? "●" : " "
-              color: Color.accent
-              font.family: Style.font.family
+              text: parent.item.kind === "mode"
+                ? parent.item.glyph
+                : (parent.item.checked ? "✓" : "")
+              color: parent.item.kind === "mode" ? root.menuValue : root.menuInk
+              font.family: root.menuFont
               font.pixelSize: Style.font.body
             }
 
             Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.spacing.controlPaddingX + Style.space(18)
-              anchors.right: parent.right
-              anchors.rightMargin: Style.spacing.controlPaddingX
+              visible: parent.isRow
+              x: root.menuGutter + (parent.hasSlot ? root.menuSlot : 0)
+              width: parent.width - x - root.menuGutter - Style.space(64)
               anchors.verticalCenter: parent.verticalCenter
-              text: root.modeLabel(parent.modelData)
-              color: Color.popups.text
-              font.family: Style.font.family
+              text: parent.item.label
+              color: parent.item.kind === "choice" && !parent.item.checked
+                ? root.menuValue : root.menuInk
+              font.family: root.menuFont
               font.pixelSize: Style.font.body
               elide: Text.ElideRight
             }
 
+            Text {
+              visible: parent.isRow && !!parent.item.value
+              anchors.right: parent.right
+              anchors.rightMargin: root.menuGutter
+              anchors.verticalCenter: parent.verticalCenter
+              text: parent.item.kind === "option"
+                ? parent.item.value + (root.snapExpanded === parent.item.id ? "  ⌄" : "  ›")
+                : parent.item.value
+              color: parent.item.kind === "mode" ? root.menuInk : root.menuValue
+              font.family: root.menuFont
+              font.pixelSize: Style.font.body
+            }
+
             MouseArea {
+              visible: parent.isRow
               anchors.fill: parent
-              enabled: !root.applying
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
+              enabled: !(root.applying && parent.item.kind === "mode")
               onEntered: root.menuCursor = parent.index
-              onClicked: root.startApply(parent.modelData)
+              onClicked: root.activateMenuItem()
             }
-          }
-        }
-
-        Rectangle {
-          width: menuRows.width - Style.spacing.controlPaddingX * 2
-          anchors.horizontalCenter: parent.horizontalCenter
-          height: Math.max(1, Style.spacing.hairline)
-          color: Color.popups.text
-          opacity: 0.18
-        }
-
-        Rectangle {
-          width: menuRows.width
-          height: Style.spacing.popupRowHeight
-          radius: Math.max(1, Style.cornerRadius - Style.spacing.hairline)
-          readonly property bool cursorRow: root.menuCursor === root.modes.length
-          color: cursorRow
-            ? Style.hoverFillFor(Color.popups.text, Color.accent) : "transparent"
-
-          Text {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.spacing.controlPaddingX
-            anchors.verticalCenter: parent.verticalCenter
-            text: root.snapEnabled ? "●" : " "
-            color: Color.accent
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-          }
-
-          Text {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.spacing.controlPaddingX + Style.space(18)
-            anchors.right: parent.right
-            anchors.rightMargin: Style.spacing.controlPaddingX
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Snap zones"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-            elide: Text.ElideRight
-          }
-
-          MouseArea {
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onEntered: root.menuCursor = root.modes.length
-            onClicked: root.toggleSnapAssist()
           }
         }
       }
@@ -969,7 +1108,7 @@ BarWidget {
       if (root.snapPendingWrite) {
         root.snapPendingWrite = false
         if (exitCode === 0) {
-          snapFile.setText(JSON.stringify({ enabled: root.snapEnabled }) + "\n")
+          snapFile.setText(root.snapFilePayload())
         } else {
           console.warn("omarchy-modes.switcher: could not create state directories for snap toggle")
         }
@@ -1073,16 +1212,21 @@ BarWidget {
     id: snapNotifier
   }
 
-  // Click-through snap cue: the surface only exists while an edge candidate
-  // is active, so there is never a stray overlay that could intercept input.
-  // mask: Region {} makes it visual-only — Omarchy's drag owns the pointer.
+  // Click-through snap cue: surfaces exist for the whole drag so the cue
+  // paints the same frame the candidate flips on — creating a layer surface
+  // at candidate time lags behind a real drag. mask: Region {} keeps them
+  // visual-only; Omarchy's drag owns the pointer throughout.
   Variants {
-    model: root.snapCandidateScreen ? [root.snapCandidateScreen] : []
+    model: root.snapDragging ? Quickshell.screens : []
 
     PanelWindow {
       id: snapOverlay
       required property var modelData
-      property var monitorMeta: root.snapMonitorMeta(root.snapHoverMonitor)
+      property string screenName: modelData ? String(modelData.name || "") : ""
+      property var monitorMeta: root.snapMonitorMeta(screenName)
+      // Cue only on the screen whose monitor owns the candidate.
+      readonly property bool cueHere: root.snapCandidate !== null
+        && root.snapHoverMonitor === screenName
       screen: modelData
       anchors { top: true; bottom: true; left: true; right: true }
       color: "transparent"
@@ -1094,13 +1238,13 @@ BarWidget {
 
       Rectangle {
         readonly property var candidate: root.snapCandidate
-        visible: candidate !== null
+        visible: snapOverlay.cueHere && candidate !== null
         x: (candidate ? candidate.x : 0) - (snapOverlay.monitorMeta ? snapOverlay.monitorMeta.x : 0)
         y: (candidate ? candidate.y : 0) - (snapOverlay.monitorMeta ? snapOverlay.monitorMeta.y : 0)
         width: candidate ? candidate.width : 0
         height: candidate ? candidate.height : 0
         radius: Style.cornerRadius
-        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.30)
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.38)
         border.color: Color.accent
         border.width: 3
       }

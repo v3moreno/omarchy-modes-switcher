@@ -6,14 +6,15 @@
  * Model (Windows-like):
  *   - default layout is a single row of two columns on any monitor;
  *   - dragging near a side edge offers that side's column (full height);
- *   - dragging near the top/bottom edge offers that row (full width, half
- *     height); on wide monitors the centre portion of those edges offers the
- *     middle column instead;
+ *   - dragging near the top/bottom edge offers the upper/lower half of the
+ *     column under the cursor (up to two rows per column); on wide monitors
+ *     the centre portion of those edges offers the full middle column;
  *   - pushing all the way to the very top (onto the bar / top bezel) offers
  *     fullscreen;
  *   - away from every edge: no candidate, no overlay.
  *
- * Columns by aspect class of the monitor:
+ * Columns by aspect class of the monitor (auto), or a fixed 2/3/4 when the
+ * user overrides it:
  *   < 1.9  (16:9, 16:10, ...)        -> 2 columns (side edges only)
  *   < 3.0  (21:9 ultrawide, ~34")    -> 3 columns (middle edges enabled)
  *   >= 3.0 (32:9 super-ultrawide)    -> 4 columns (middle edges span the two
@@ -35,7 +36,10 @@ var EDGE_Y = 110;
 // the physical top means y <= work-area top + this pad.
 var FULL_TOP_PAD = 8;
 
-function columnsFor(width, height) {
+// `override` pins the layout to a fixed column count regardless of aspect;
+// 0/undefined means detect from the monitor.
+function columnsFor(width, height, override) {
+    if (override === 2 || override === 3 || override === 4) return override;
     if (typeof width !== "number" || typeof height !== "number" || height <= 0) {
         return 2;
     }
@@ -122,6 +126,24 @@ function middleColumn(area, cols, gapsOut, gapsIn) {
     return rect(first.x, first.y, last.x + last.width - first.x, first.height, "col-middle");
 }
 
+// Split a column's window rect into its upper/lower row, keeping the same
+// gaps_in spacing between the two windows as Hyprland tiles would.
+function rowHalf(colRect, top, gapsIn, name) {
+    var innerGap = gapsIn.top + gapsIn.bottom;
+    var h = (colRect.height - innerGap) / 2;
+    if (top) return rect(colRect.x, colRect.y, colRect.width, h, name);
+    return rect(colRect.x, colRect.y + h + innerGap, colRect.width, h, name);
+}
+
+// Which grid column a global x lands in, using cell (not window-rect)
+// boundaries so cursor positions inside the gaps still resolve.
+function columnIndexAt(area, cols, gapsOut, x) {
+    var usableX = area.x + gapsOut.left;
+    var usableW = Math.max(1, area.width - gapsOut.left - gapsOut.right);
+    var idx = Math.floor((x - usableX) / (usableW / cols));
+    return Math.max(0, Math.min(cols - 1, idx));
+}
+
 function fullscreenRect(area, gapsOut, gapsIn) {
     return rect(area.x + gapsOut.left + gapsIn.left, area.y + gapsOut.top + gapsIn.top,
         area.width - gapsOut.left - gapsOut.right - gapsIn.left - gapsIn.right,
@@ -133,11 +155,20 @@ function fullscreenRect(area, gapsOut, gapsIn) {
  * The single snap the cursor implies on this monitor, or null when it is not
  * near an actionable edge. `x`/`y` are global coordinates; `area` is the
  * monitor's work area and `cols` its column count.
+ *
+ * `opts` tunes the behaviour:
+ *   opts.rows  — when false the top/bottom edge never offers the per-column
+ *                half rows (middle column and fullscreen still apply);
+ *   opts.reach — scales the edge proximity bands (1 = normal).
  */
-function edgeCandidate(area, cols, x, y, gapsOut, gapsIn) {
+function edgeCandidate(area, cols, x, y, gapsOut, gapsIn, opts) {
     if (!area || area.width <= 0 || area.height <= 0) return null;
-    if (x < area.x || x >= area.x + area.width + EDGE_X) return null;
-    if (y < area.y - EDGE_Y - gapsOut.top || y > area.y + area.height + EDGE_Y) return null;
+    var rows = !opts || opts.rows !== false;
+    var reach = opts && isFinite(opts.reach) && opts.reach > 0 ? opts.reach : 1;
+    var edgeX = EDGE_X * reach;
+    var edgeY = EDGE_Y * reach;
+    if (x < area.x || x >= area.x + area.width + edgeX) return null;
+    if (y < area.y - edgeY - gapsOut.top || y > area.y + area.height + edgeY) return null;
 
     // All the way up: over the bar / top bezel -> fullscreen.
     if (y <= area.y + FULL_TOP_PAD) {
@@ -145,41 +176,34 @@ function edgeCandidate(area, cols, x, y, gapsOut, gapsIn) {
     }
 
     var colsCells = cellRects(area, cols, true, gapsOut, gapsIn);
-    var rowsCells = cellRects(area, 2, false, gapsOut, gapsIn);
 
     var distLeft = x - area.x;
     var distRight = area.x + area.width - x;
     var distTop = y - area.y;
     var distBottom = area.y + area.height - y;
 
-    var horiz = Math.min(distTop, distBottom) <= EDGE_Y ? (distTop <= distBottom ? "top" : "bottom") : null;
-    var vert = Math.min(distLeft, distRight) <= EDGE_X ? (distLeft <= distRight ? "left" : "right") : null;
+    var horiz = Math.min(distTop, distBottom) <= edgeY ? (distTop <= distBottom ? "top" : "bottom") : null;
+    var vert = Math.min(distLeft, distRight) <= edgeX ? (distLeft <= distRight ? "left" : "right") : null;
     if (!horiz && !vert) return null;
 
     var candidate = null;
     if (horiz) {
-        candidate = horiz === "top" ? rowsCells[0] : rowsCells[1];
-        if (candidate) candidate.name = "row-" + horiz;
+        var colIdx = columnIndexAt(area, cols, gapsOut, x);
         // Wide monitors: the centre stretch of the top/bottom edge snaps to
-        // the middle column instead of a row.
-        if (cols >= 3) {
-            var middle = middleColumn(area, cols, gapsOut, gapsIn);
-            if (middle && x >= middle.x && x < middle.x + middle.width) {
-                candidate = middle;
-            }
+        // the full middle column; elsewhere the edge snaps that column's row.
+        var middle = cols >= 3 ? middleColumn(area, cols, gapsOut, gapsIn) : null;
+        if (middle && colIdx >= 1 && colIdx <= cols - 2) {
+            candidate = middle;
+        } else if (rows && colsCells[colIdx]) {
+            candidate = rowHalf(colsCells[colIdx], horiz === "top", gapsIn,
+                "row-" + horiz + "-col" + colIdx);
         }
     }
-    // Corners belong to whichever edge the cursor is proportionally closer to.
-    if (vert) {
-        var vertical = vert === "left" ? colsCells[0] : colsCells[colsCells.length - 1];
-        if (vertical) vertical.name = "col-" + vert;
-        if (!candidate) {
-            candidate = vertical;
-        } else {
-            var horizScore = horiz === "top" ? distTop / EDGE_Y : distBottom / EDGE_Y;
-            var vertScore = vert === "left" ? distLeft / EDGE_X : distRight / EDGE_X;
-            if (vertScore < horizScore) candidate = vertical;
-        }
+    // Top/bottom proximity wins outright: side columns are only offered along
+    // the middle stretch of the side edge, never over a corner row snap.
+    if (!candidate && vert) {
+        candidate = vert === "left" ? colsCells[0] : colsCells[colsCells.length - 1];
+        if (candidate) candidate.name = "col-" + vert;
     }
     return candidate || null;
 }

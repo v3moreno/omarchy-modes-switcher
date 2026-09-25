@@ -17,21 +17,30 @@ The widget shows the focused workspace's mode; click it to open the mode menu. S
 
 ## Snap zones
 
-An optional Windows-style snap assist, toggled from the **Snap zones** row at the bottom of the mode menu.
+An optional Windows-style snap assist, configured from the **SNAP** section at the bottom of the mode menu.
 
 When enabled, `SUPER + drag` a window (Omarchy's native move) toward a screen edge and a cue shows the exact snap it will take; release to land it:
 
 ![Snap cue overlay](preview-snap.png)
 
-- **Side edges** → left/right column (the default is a single row of 2 columns).
-- **Top/bottom edges** → top/bottom row (full width, half height — up to 2 rows).
-- **Ultrawides** (~21:9, 34″): the middle stretch of the top/bottom edges also offers a **middle column**; super-ultrawide (~32:9, 49″) offers a wider middle spanning two of four columns.
+- **Side edges** → left/right column, full height (the default is a single row of 2 columns).
+- **Top/bottom edges** → that column's **upper/lower row** (half height — up to 2 rows within each column).
+- **Ultrawides** (~21:9, 34″): the middle stretch of the top/bottom edges instead offers the full **middle column**; super-ultrawide (~32:9, 49″) offers a wider middle spanning two of four columns.
 - **All the way up** (over the bar / top bezel) → fullscreen snap.
 - Snapped geometry respects your configured `general:gaps_in` / `general:gaps_out`, so a snapped window lands where a tiled window would.
 - No cue in the middle of the screen — nothing shows until the cursor is near an actionable edge, and only the snap that would fire is previewed.
 - Works in every mode — tiled windows are floated and placed; floating windows just move. Dropping away from edges (or on the bar) leaves the window where the native drag put it — a plain `SUPER + click` never snaps.
 - The cue is a click-through layer-shell surface that only exists while a snap is armed; it never eats your pointer.
-- The toggle persists to `~/.local/state/omarchy-modes/snap-assist.json` and regenerates the drop-in, adding/removing two `non_consuming` `SUPER + mouse:272` binds that observe the press/release while Omarchy's drag bind still does the moving.
+- All settings persist to `~/.local/state/omarchy-modes/snap-assist.json`; the enabled flag also regenerates the drop-in, adding/removing two `non_consuming` `SUPER + mouse:272` binds that observe the press/release while Omarchy's drag bind still does the moving.
+
+### Snap settings
+
+| Setting | Default | Options | Description |
+| --- | --- | --- | --- |
+| `enabled` | off | on/off | Arm the snap binds |
+| `columns` | auto | auto/2/3/4 | Columns per monitor. `auto` detects from aspect: 2 below 1.9:1, 3 on ~21:9, 4 on ~32:9. A fixed number forces that split on every monitor. |
+| `rows` | on | on/off | The top/bottom-edge half snaps within each column. Off leaves the middle column and fullscreen only. |
+| `reach` | normal | near/normal/far | How close to an edge the cue and snap arm (70% / 100% / 150% of the base distance). |
 
 ## Install
 
