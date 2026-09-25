@@ -2,10 +2,12 @@ import QtQuick
 import Quickshell
 import Quickshell.Hyprland
 import Quickshell.Io
+import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 import "engine/state.js" as State
 import "engine/dropin.js" as Dropin
+import "engine/snap.js" as Snap
 
 BarWidget {
   id: root
@@ -36,8 +38,51 @@ BarWidget {
   property var hyprctlContinuation: null
   property string hyprctlDescription: ""
   property int menuCursor: 0
-  property bool dropinMissing: false
+  property bool dropinReady: false
   property bool dropinNeedsReload: false
+  property string dropinExisting: ""
+
+  // Snap assist: non-consuming SUPER+drag press/release binds land on the
+  // snapDragStart/snapDragEnd IPC handlers while Omarchy's own drag bind moves
+  // the window. State machine: idle -> probing -> dragging -> (armed) -> snap.
+  property bool snapLoaded: false
+  property bool snapEnabled: false
+  property bool snapDragging: false
+  property bool snapReleased: false
+  property double snapPressX: 0
+  property double snapPressY: 0
+  property string snapWindow: ""
+  property var snapMonitors: []
+  property var snapAreas: ({})
+  property var snapGapsIn: Snap.parseGaps("")
+  property var snapGapsOut: Snap.parseGaps("")
+  property string snapHoverMonitor: ""
+  // The one snap the cursor currently implies — null away from every edge.
+  property var snapCandidate: null
+  // Release failsafe: while the dragged floating window tracks the cursor the
+  // grab offset stays constant; once released the window stops following and
+  // a few consecutive diverged polls stand in for a missed release bind.
+  property double snapGrabX: 0
+  property double snapGrabY: 0
+  property int snapDiverged: 0
+  property double snapLastX: -1
+  property double snapLastY: -1
+  property var snapContinuation: null
+  property string snapDescription: ""
+  property bool snapPendingWrite: false
+  readonly property int snapPollMs: 40
+  readonly property int snapDragTimeoutMs: 45000
+  readonly property int snapDivergencePx: 60
+  readonly property int snapDivergenceTicks: 3
+
+  readonly property var snapCandidateScreen: {
+    if (!snapCandidate || snapHoverMonitor === "") return null
+    var screens = Quickshell.screens.values()
+    for (var i = 0; i < screens.length; i += 1) {
+      if (screens[i] && String(screens[i].name) === snapHoverMonitor) return screens[i]
+    }
+    return null
+  }
 
   // This is a live mirror maintained by Quickshell's Hyprland IPC integration.
   // It changes on workspace events; no polling is involved.
@@ -127,19 +172,26 @@ BarWidget {
 
   // Widget teardown removes the drop-in, so a fresh instance rewrites it from
   // persisted state — otherwise a shell restart would silently drop the rules.
-  // The reload is deferred to onSaved; FileView writes are async.
+  // The reload is deferred to onSaved; FileView writes are async. Regenerates
+  // whenever the on-disk content differs from what the current state + flags
+  // would produce (missing file, stale file, or a toggled flag).
   function reconcileDropin() {
-    if (!stateLoaded || !dropinMissing) return
-    if (Object.keys(modeState.modes).length === 0) return
-    dropinMissing = false
-    dropinNeedsReload = true
+    if (!stateLoaded || !snapLoaded || !dropinReady) return
+    var expected
     try {
-      dropinFile.setText(Dropin.generateDropin(modeState, {
-        enableKeybinds: root.enableKeybinds
-      }))
+      expected = Dropin.generateDropin(modeState, dropinFlags())
     } catch (error) {
-      dropinNeedsReload = false
+      console.warn("omarchy-modes.switcher: could not generate drop-in: " + error.message)
+      return
     }
+    if (expected === dropinExisting) return
+    // Nothing to emit yet — leave the file absent rather than write a stub.
+    if (Object.keys(modeState.modes).length === 0 && !snapEnabled) return
+    dropinNeedsReload = true
+    // Track the write synchronously — dropinExisting updates via async
+    // reloads and a fast toggle-off/on would otherwise skip a needed write.
+    dropinExisting = expected
+    dropinFile.setText(expected)
   }
 
   function failApply(message) {
@@ -214,9 +266,9 @@ BarWidget {
       // vocabulary and rejects anything else before serialisation.
       State.validateState(pendingState)
       applyPhase = "writing-dropin"
-      dropinFile.setText(Dropin.generateDropin(pendingState, {
-        enableKeybinds: root.enableKeybinds
-      }))
+      var dropinText = Dropin.generateDropin(pendingState, dropinFlags())
+      root.dropinExisting = dropinText
+      dropinFile.setText(dropinText)
     } catch (error) {
       failApply("Could not generate the drop-in: " + error.message)
     }
@@ -353,6 +405,315 @@ BarWidget {
     })
   }
 
+  // ---- snap assist ----
+
+  function dropinFlags() {
+    return { enableKeybinds: root.enableKeybinds, snapAssist: root.snapEnabled }
+  }
+
+  function parseCursorPos(text) {
+    var match = /^\s*(-?\d+)[,\s]\s*(-?\d+)/.exec(String(text))
+    if (!match) return null
+    return { x: Number(match[1]), y: Number(match[2]) }
+  }
+
+  // Topmost window under a global point: geometry hit-test restricted to
+  // workspaces that are actually displayed on a monitor — off-workspace
+  // clients keep stale geometry that can contain the cursor. Lowest
+  // focusHistoryID (0 = most recently focused) wins overlaps.
+  function windowAtCursor(clients, x, y, visibleWorkspaces) {
+    var best = ""
+    var bestFocus = -1
+    for (var i = 0; i < clients.length; i++) {
+      var c = clients[i]
+      if (!c || !c.mapped || c.hidden) continue
+      var ws = c.workspace ? String(c.workspace.name || "") : ""
+      if (ws.indexOf("special:") === 0) continue
+      if (visibleWorkspaces && visibleWorkspaces[ws] !== true) continue
+      var at = c.at, size = c.size
+      if (!at || !size || x < at[0] || x >= at[0] + size[0] || y < at[1] || y >= at[1] + size[1]) continue
+      var focus = typeof c.focusHistoryID === "number" ? c.focusHistoryID : 2147483647
+      if (best === "" || focus < bestFocus) {
+        bestFocus = focus
+        best = c.address
+      }
+    }
+    return best
+  }
+
+  function snapMonitorMeta(name) {
+    for (var i = 0; i < snapMonitors.length; i++) {
+      if (snapMonitors[i] && snapMonitors[i].name === name) return snapMonitors[i]
+    }
+    return null
+  }
+
+  function runSnap(command, description, continuation) {
+    if (snapProcess.running) {
+      console.warn("omarchy-modes.switcher: snap step busy: " + description)
+      return false
+    }
+    snapDescription = description
+    snapContinuation = continuation
+    snapProcess.command = command
+    snapProcess.running = true
+    snapWatchdog.restart()
+    return true
+  }
+
+  function snapNotify(summary, body) {
+    if (snapNotifier.running) return
+    snapNotifier.command = ["notify-send", "-a", "Omarchy Modes Switcher", summary, body]
+    snapNotifier.running = true
+  }
+
+  function resetSnapDrag() {
+    snapDragging = false
+    snapReleased = false
+    snapWindow = ""
+    snapMonitors = []
+    snapAreas = ({})
+    snapHoverMonitor = ""
+    snapCandidate = null
+    snapDiverged = 0
+    snapContinuation = null
+    snapCursorTimer.stop()
+    snapTimeout.stop()
+    snapWatchdog.stop()
+  }
+
+  function snapFail(message) {
+    console.warn("omarchy-modes.switcher: " + message)
+    snapNotify("Snap failed", message)
+    resetSnapDrag()
+  }
+
+  function snapDragStart() {
+    if (!snapLoaded || !snapEnabled) return "disabled"
+    if (snapDragging || snapProcess.running) return "busy"
+    snapDragging = true
+    snapReleased = false
+    snapHoverMonitor = ""
+    snapCandidate = null
+    snapWindow = ""
+    snapDiverged = 0
+    snapTimeout.restart()
+    runSnap(["sh", "-c", "hyprctl cursorpos; echo ===; hyprctl -j clients; echo ===; hyprctl -j monitors"
+      + "; echo ===; hyprctl -j getoption general:gaps_in; echo ===; hyprctl -j getoption general:gaps_out"],
+      "drag probe", onSnapProbe)
+    return "probing"
+  }
+
+  function onSnapProbe(text) {
+    var parts = String(text).split("\n===\n")
+    if (parts.length !== 5) { snapFail("drag probe: unexpected output"); return }
+    var pos = parseCursorPos(parts[0])
+    var clients, monitors, gapsInOpt, gapsOutOpt
+    try {
+      clients = JSON.parse(parts[1])
+      monitors = JSON.parse(parts[2])
+      gapsInOpt = JSON.parse(parts[3])
+      gapsOutOpt = JSON.parse(parts[4])
+    } catch (error) {
+      snapFail("drag probe did not return JSON: " + error.message)
+      return
+    }
+    if (!pos || !Array.isArray(clients) || !Array.isArray(monitors)) {
+      snapFail("drag probe returned unusable data")
+      return
+    }
+    snapGapsIn = Snap.parseGaps(gapsInOpt && gapsInOpt.css)
+    snapGapsOut = Snap.parseGaps(gapsOutOpt && gapsOutOpt.css)
+    snapPressX = pos.x
+    snapPressY = pos.y
+    snapMonitors = monitors
+    var areas = ({})
+    var visible = ({})
+    for (var i = 0; i < monitors.length; i++) {
+      var m = monitors[i]
+      if (m && m.name) {
+        var area = Snap.workArea(m)
+        areas[String(m.name)] = { area: area, cols: Snap.columnsFor(area.width, area.height) }
+      }
+      var aw = m && m.activeWorkspace
+      if (aw) visible[String(aw.name || "")] = true
+    }
+    snapAreas = areas
+    snapWindow = windowAtCursor(clients, pos.x, pos.y, visible)
+    // The press must have landed on a real window — clicks on the bar,
+    // wallpaper, or empty workspace never arm a snap.
+    if (!validAddress(snapWindow) || snapReleased) {
+      resetSnapDrag()
+      return
+    }
+    // Grab offset for the release-divergence failsafe: while a floating
+    // window is dragged its position stays press-at - press-cursor.
+    snapGrabX = 0
+    snapGrabY = 0
+    for (var c = 0; c < clients.length; c++) {
+      if (clients[c] && clients[c].address === snapWindow && clients[c].at) {
+        snapGrabX = clients[c].at[0] - pos.x
+        snapGrabY = clients[c].at[1] - pos.y
+        break
+      }
+    }
+    snapCursorTimer.restart()
+  }
+
+  function snapCursorTick() {
+    if (!snapDragging || snapProcess.running) return
+    runSnap(["sh", "-c", "hyprctl cursorpos; echo ===; hyprctl -j activewindow"],
+      "cursor poll", function(text) {
+      var parts = String(text).split("\n===\n")
+      var pos = parseCursorPos(parts[0])
+      if (!pos) return
+      snapLastX = pos.x
+      snapLastY = pos.y
+      var monitor = Snap.monitorAt(snapMonitors, pos.x, pos.y)
+      snapHoverMonitor = monitor ? String(monitor.name) : ""
+      // Clicks are not drags: the cursor must travel before any edge can
+      // offer a snap. Candidate stays null in the workspace interior.
+      snapCandidate = null
+      if (monitor && Snap.dragIsArmed(snapPressX, snapPressY, pos.x, pos.y)) {
+        var meta = snapAreas[snapHoverMonitor]
+        if (meta) {
+          snapCandidate = Snap.edgeCandidate(meta.area, meta.cols, pos.x, pos.y, snapGapsOut, snapGapsIn)
+        }
+      }
+      // Release failsafe: if the release bind never reaches us, the dragged
+      // floating window stops tracking the cursor — three diverged polls is
+      // the drop. Tiled drags do not follow the cursor, so floating-only.
+      var win = null
+      if (parts.length === 2) {
+        try { win = JSON.parse(parts[1]) } catch (e) { win = null }
+      }
+      if (win && win.address === snapWindow && win.floating === true && win.at) {
+        var diverged = Math.abs(win.at[0] - (pos.x + snapGrabX)) > snapDivergencePx
+          || Math.abs(win.at[1] - (pos.y + snapGrabY)) > snapDivergencePx
+        snapDiverged = diverged ? snapDiverged + 1 : 0
+        if (snapDiverged >= snapDivergenceTicks) snapDragEnd()
+      } else {
+        snapDiverged = 0
+      }
+    })
+  }
+
+  function snapDragEnd() {
+    if (!snapDragging) return "ignored"
+    // A release that lands while a probe/poll is still in flight is deferred —
+    // the process exit handler re-invokes this once the pipe is free.
+    if (snapProcess.running) {
+      snapReleased = true
+      return "deferred"
+    }
+    var candidate = snapCandidate
+    var monitor = snapMonitorMeta(snapHoverMonitor)
+    if (!candidate || !monitor || !validAddress(snapWindow)) {
+      resetSnapDrag()
+      return "ignored"
+    }
+    executeSnap(candidate, monitor, snapWindow)
+    return "snapping"
+  }
+
+  // The drop chain: re-read clients for liveness + float state, move across
+  // workspaces if the drop landed on another monitor, float, then exact
+  // pixel resize + move, then verify. One hyprctl call per step.
+  function executeSnap(zone, monitor, address) {
+    snapCursorTimer.stop()
+    snapTimeout.stop()
+    runSnap(["hyprctl", "-j", "clients"], "snap clients", function(text) {
+      var clients
+      try { clients = JSON.parse(text) } catch (e) { snapFail("snap clients not JSON"); return }
+      var client = null
+      for (var i = 0; i < clients.length; i++) {
+        if (clients[i] && clients[i].address === address) { client = clients[i]; break }
+      }
+      if (!client) { resetSnapDrag(); return }
+      var steps = []
+      var targetWorkspace = monitor.activeWorkspace ? String(monitor.activeWorkspace.name || "") : ""
+      var currentWorkspace = client.workspace ? String(client.workspace.name || "") : ""
+      // Cross-monitor drops land on that monitor's active workspace.
+      if (validWorkspaceId(targetWorkspace) && targetWorkspace !== currentWorkspace) {
+        steps.push("hl.dsp.window.move({ workspace = \"" + targetWorkspace +
+          "\", window = \"address:" + address + "\", follow = false })")
+      }
+      if (client.floating !== true) {
+        steps.push("hl.dsp.window.float({ window = \"address:" + address +
+          "\", action = \"enable\" })")
+      }
+      Array.prototype.push.apply(steps, Snap.snapCommands(address, zone))
+      runSnapSteps(steps, address, zone)
+    })
+  }
+
+  function runSnapSteps(steps, address, zone) {
+    if (steps.length === 0) { verifySnap(address, zone); return }
+    var step = steps[0]
+    runSnap(["hyprctl", "dispatch", step], "snap step", function() {
+      runSnapSteps(steps.slice(1), address, zone)
+    })
+  }
+
+  function verifySnap(address, zone) {
+    runSnap(["hyprctl", "-j", "clients"], "snap verify", function(text) {
+      var clients
+      try { clients = JSON.parse(text) } catch (e) { snapFail("snap verify not JSON"); return }
+      var client = null
+      for (var i = 0; i < clients.length; i++) {
+        if (clients[i] && clients[i].address === address) { client = clients[i]; break }
+      }
+      resetSnapDrag()
+      if (!client) return
+      // Min/max window sizes can clamp the resize, so verify position rather
+      // than demanding the exact rectangle.
+      var onTarget = client.at && Math.abs(client.at[0] - zone.x) < 40
+        && Math.abs(client.at[1] - zone.y) < 40
+      if (!onTarget) snapNotify("Snap did not land", "The window did not move to the snap zone.")
+    })
+  }
+
+  function loadSnapFile(text) {
+    snapLoaded = true
+    var enabled = false
+    try {
+      var parsed = JSON.parse(text || "")
+      enabled = parsed && parsed.enabled === true
+    } catch (error) {
+      enabled = false
+    }
+    if (enabled !== snapEnabled) {
+      snapEnabled = enabled
+      // Reconcile regenerates the drop-in when the persisted flag differs
+      // from what the current file content was generated with.
+      reconcileDropin()
+    }
+  }
+
+  function toggleSnapAssist() {
+    if (!snapLoaded) return "not-ready"
+    // Optimistic: flip now and regenerate the drop-in immediately — the
+    // FileView save is durable state for the next shell start, not the
+    // switch that arms the binds in this session.
+    snapEnabled = !snapEnabled
+    if (!snapEnabled && snapDragging) resetSnapDrag()
+    reconcileDropin()
+    // snap-assist.json lives in stateDirectory, which a fresh profile may not
+    // have yet — ensure it exists first rather than failing the write silently.
+    if (ensureDirectories.running) {
+      snapFile.setText(JSON.stringify({ enabled: snapEnabled }) + "\n")
+      return "toggled"
+    }
+    snapPendingWrite = true
+    ensureDirectories.command = ["mkdir", "-p", stateDirectory, dropinDirectory]
+    ensureDirectories.running = true
+    return "toggled"
+  }
+
+  function snapFileLoaded(text) {
+    loadSnapFile(text)
+  }
+
   implicitWidth: triggerRow.implicitWidth
   implicitHeight: triggerRow.implicitHeight
 
@@ -361,6 +722,29 @@ BarWidget {
 
     function cycle(): string { return root.cycleMode() }
     function setMode(mode: string): string { return root.setMode(mode) }
+    function menu(): string { root.toggle(); return "toggled" }
+    function snapDragStart(): string { return root.snapDragStart() }
+    function snapDragEnd(): string { return root.snapDragEnd() }
+    function snapToggle(): string { return root.toggleSnapAssist() }
+    function snapDebug(): string {
+      try {
+        var meta = root.snapAreas[root.snapHoverMonitor]
+        return JSON.stringify({
+          enabled: root.snapEnabled, dragging: root.snapDragging,
+          window: root.snapWindow, hoverMonitor: root.snapHoverMonitor,
+          candidate: root.snapCandidate, diverged: root.snapDiverged,
+          lastX: root.snapLastX, lastY: root.snapLastY,
+          pressX: root.snapPressX, pressY: root.snapPressY,
+          pollRunning: snapProcess.running, timerRunning: snapCursorTimer.running,
+          gapsIn: root.snapGapsIn, gapsOut: root.snapGapsOut,
+          areas: Object.keys(root.snapAreas).map(function(k) {
+            return k + ":" + root.snapAreas[k].cols + "col"
+          }),
+          monitors: root.snapMonitors.map(function(m) { return m.name }),
+          cols: meta ? meta.cols : 0
+        })
+      } catch (e) { return "debug-error: " + e.message }
+    }
   }
 
   Row {
@@ -403,9 +787,12 @@ BarWidget {
       anchors.fill: parent
       onMoveRequested: function(dx, dy) {
         if (dy === 0) return
-        root.menuCursor = Math.max(0, Math.min(root.modes.length - 1, root.menuCursor + dy))
+        root.menuCursor = Math.max(0, Math.min(root.modes.length, root.menuCursor + dy))
       }
-      onActivateRequested: root.startApply(root.modes[root.menuCursor])
+      onActivateRequested: {
+        if (root.menuCursor < root.modes.length) root.startApply(root.modes[root.menuCursor])
+        else root.toggleSnapAssist()
+      }
       onCloseRequested: root.close()
 
       Column {
@@ -461,6 +848,54 @@ BarWidget {
             }
           }
         }
+
+        Rectangle {
+          width: menuRows.width - Style.spacing.controlPaddingX * 2
+          anchors.horizontalCenter: parent.horizontalCenter
+          height: Math.max(1, Style.spacing.hairline)
+          color: Color.popups.text
+          opacity: 0.18
+        }
+
+        Rectangle {
+          width: menuRows.width
+          height: Style.spacing.popupRowHeight
+          radius: Math.max(1, Style.cornerRadius - Style.spacing.hairline)
+          readonly property bool cursorRow: root.menuCursor === root.modes.length
+          color: cursorRow
+            ? Style.hoverFillFor(Color.popups.text, Color.accent) : "transparent"
+
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.spacing.controlPaddingX
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.snapEnabled ? "●" : " "
+            color: Color.accent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
+
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.spacing.controlPaddingX + Style.space(18)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.spacing.controlPaddingX
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Snap zones"
+            color: Color.popups.text
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onEntered: root.menuCursor = root.modes.length
+            onClicked: root.toggleSnapAssist()
+          }
+        }
       }
     }
   }
@@ -484,8 +919,14 @@ BarWidget {
     watchChanges: true
     atomicWrites: true
     printErrors: false
+    onLoaded: {
+      root.dropinExisting = text()
+      root.dropinReady = true
+      root.reconcileDropin()
+    }
     onLoadFailed: {
-      root.dropinMissing = true
+      root.dropinExisting = ""
+      root.dropinReady = true
       root.reconcileDropin()
     }
     onFileChanged: reload()
@@ -508,9 +949,32 @@ BarWidget {
     }
   }
 
+  FileView {
+    id: snapFile
+    path: root.stateDirectory + "/snap-assist.json"
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.snapFileLoaded(text())
+    onLoadFailed: root.snapFileLoaded(null)
+    onFileChanged: reload()
+    // A failed save only means the next session starts disabled — the
+    // in-memory flag keeps this session consistent.
+    onSaveFailed: console.warn("omarchy-modes.switcher: could not persist snap-assist.json")
+  }
+
   Process {
     id: ensureDirectories
     onExited: function(exitCode) {
+      if (root.snapPendingWrite) {
+        root.snapPendingWrite = false
+        if (exitCode === 0) {
+          snapFile.setText(JSON.stringify({ enabled: root.snapEnabled }) + "\n")
+        } else {
+          console.warn("omarchy-modes.switcher: could not create state directories for snap toggle")
+        }
+        return
+      }
       if (!root.applying || root.applyPhase !== "ensuring-directories") return
       if (exitCode !== 0) root.failApply("Could not create the state directories.")
       else root.writeState()
@@ -544,6 +1008,102 @@ BarWidget {
       hyprctlProcess.signal(9)
       root.failApply("hyprctl " + root.hyprctlDescription + " did not answer within "
         + root.hyprctlTimeoutMs + "ms; Hyprland IPC may be wedged.")
+    }
+  }
+
+  // ---- snap assist plumbing ----
+
+  Process {
+    id: snapProcess
+    stdout: StdioCollector { id: snapStdout; waitForEnd: true }
+    stderr: StdioCollector { id: snapStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      snapWatchdog.stop()
+      var continuation = root.snapContinuation
+      root.snapContinuation = null
+      if (exitCode !== 0) {
+        console.warn("omarchy-modes.switcher: snap step '" + root.snapDescription
+          + "' failed" + (snapStderr.text ? ": " + String(snapStderr.text).trim() : "."))
+        if (root.snapDragging) root.resetSnapDrag()
+        return
+      }
+      if (continuation) continuation(String(snapStdout.text || ""))
+      // A release deferred while this step ran now evaluates the drop.
+      if (root.snapReleased && root.snapDragging && !snapProcess.running) {
+        root.snapReleased = false
+        root.snapDragEnd()
+      }
+    }
+  }
+
+  Timer {
+    id: snapWatchdog
+    interval: 8000
+    repeat: false
+    onTriggered: {
+      if (!snapProcess.running) return
+      snapProcess.signal(9)
+      console.warn("omarchy-modes.switcher: snap step '" + root.snapDescription + "' timed out")
+      if (root.snapDragging) root.resetSnapDrag()
+    }
+  }
+
+  Timer {
+    id: snapCursorTimer
+    interval: root.snapPollMs
+    repeat: true
+    onTriggered: root.snapCursorTick()
+  }
+
+  // Failsafe: if the release IPC never arrives (bind removed mid-drag, IPC
+  // wedged), the drag must not leak the overlay forever.
+  Timer {
+    id: snapTimeout
+    interval: root.snapDragTimeoutMs
+    repeat: false
+    onTriggered: {
+      if (root.snapDragging) {
+        console.warn("omarchy-modes.switcher: snap drag timed out; resetting")
+        root.resetSnapDrag()
+      }
+    }
+  }
+
+  Process {
+    id: snapNotifier
+  }
+
+  // Click-through snap cue: the surface only exists while an edge candidate
+  // is active, so there is never a stray overlay that could intercept input.
+  // mask: Region {} makes it visual-only — Omarchy's drag owns the pointer.
+  Variants {
+    model: root.snapCandidateScreen ? [root.snapCandidateScreen] : []
+
+    PanelWindow {
+      id: snapOverlay
+      required property var modelData
+      property var monitorMeta: root.snapMonitorMeta(root.snapHoverMonitor)
+      screen: modelData
+      anchors { top: true; bottom: true; left: true; right: true }
+      color: "transparent"
+      WlrLayershell.namespace: "omarchy-modes-snap"
+      WlrLayershell.layer: WlrLayer.Overlay
+      WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+      exclusionMode: ExclusionMode.Ignore
+      mask: Region {}
+
+      Rectangle {
+        readonly property var candidate: root.snapCandidate
+        visible: candidate !== null
+        x: (candidate ? candidate.x : 0) - (snapOverlay.monitorMeta ? snapOverlay.monitorMeta.x : 0)
+        y: (candidate ? candidate.y : 0) - (snapOverlay.monitorMeta ? snapOverlay.monitorMeta.y : 0)
+        width: candidate ? candidate.width : 0
+        height: candidate ? candidate.height : 0
+        radius: Style.cornerRadius
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.30)
+        border.color: Color.accent
+        border.width: 3
+      }
     }
   }
 

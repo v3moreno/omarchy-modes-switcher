@@ -13,6 +13,26 @@ Each workspace gets its own mode:
 
 The widget shows the focused workspace's mode; click it to open the mode menu. Switching rewrites a generated Hyprland drop-in, reloads the compositor, and reconciles already-open windows on that workspace (floats them or tiles them).
 
+![Omarchy Modes Switcher](preview.png)
+
+## Snap zones
+
+An optional Windows-style snap assist, toggled from the **Snap zones** row at the bottom of the mode menu.
+
+When enabled, `SUPER + drag` a window (Omarchy's native move) toward a screen edge and a cue shows the exact snap it will take; release to land it:
+
+![Snap cue overlay](preview-snap.png)
+
+- **Side edges** → left/right column (the default is a single row of 2 columns).
+- **Top/bottom edges** → top/bottom row (full width, half height — up to 2 rows).
+- **Ultrawides** (~21:9, 34″): the middle stretch of the top/bottom edges also offers a **middle column**; super-ultrawide (~32:9, 49″) offers a wider middle spanning two of four columns.
+- **All the way up** (over the bar / top bezel) → fullscreen snap.
+- Snapped geometry respects your configured `general:gaps_in` / `general:gaps_out`, so a snapped window lands where a tiled window would.
+- No cue in the middle of the screen — nothing shows until the cursor is near an actionable edge, and only the snap that would fire is previewed.
+- Works in every mode — tiled windows are floated and placed; floating windows just move. Dropping away from edges (or on the bar) leaves the window where the native drag put it — a plain `SUPER + click` never snaps.
+- The cue is a click-through layer-shell surface that only exists while a snap is armed; it never eats your pointer.
+- The toggle persists to `~/.local/state/omarchy-modes/snap-assist.json` and regenerates the drop-in, adding/removing two `non_consuming` `SUPER + mouse:272` binds that observe the press/release while Omarchy's drag bind still does the moving.
+
 ## Install
 
 ```
@@ -34,6 +54,7 @@ The widget exposes an IPC target for scripts or your own bindings:
 ```
 qs ipc -n -p "$OMARCHY_PATH/shell" call omarchy-modes.switcher cycle
 qs ipc -n -p "$OMARCHY_PATH/shell" call omarchy-modes.switcher setMode master
+qs ipc -n -p "$OMARCHY_PATH/shell" call omarchy-modes.switcher snapToggle
 ```
 
 ## How it works

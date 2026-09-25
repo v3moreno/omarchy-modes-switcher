@@ -20,6 +20,14 @@ var KEYBIND_LINES = [
     'hl.bind("SUPER + ALT + SPACE", hl.dsp.exec_cmd("qs ipc -n -p \\\"$OMARCHY_PATH/shell\\\" call omarchy-modes.switcher cycle"), { description = "Cycle Omarchy mode" }) -- omarchy-modes-switcher'
 ];
 
+// Emitted only when snapAssist is set. Both are non-consuming so Omarchy's
+// own SUPER+drag still performs the move; release = true turns the release
+// event into the drop that snaps the window to the hovered zone.
+var SNAP_BIND_LINES = [
+    'hl.bind("SUPER + mouse:272", hl.dsp.exec_cmd("qs ipc -n -p \\\"$OMARCHY_PATH/shell\\\" call omarchy-modes.switcher snapDragStart"), { mouse = true, non_consuming = true, description = "Snap drag start" }) -- omarchy-modes-switcher',
+    'hl.bind("SUPER + mouse:272", hl.dsp.exec_cmd("qs ipc -n -p \\\"$OMARCHY_PATH/shell\\\" call omarchy-modes.switcher snapDragEnd"), { mouse = true, non_consuming = true, release = true, description = "Snap drop" }) -- omarchy-modes-switcher'
+];
+
 function isObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -70,7 +78,8 @@ function validateModesForGeneration(state) {
 
 function normalizeOptions(options) {
     var normalized = {
-        enableKeybinds: false
+        enableKeybinds: false,
+        snapAssist: false
     };
 
     if (typeof options === "undefined") {
@@ -84,6 +93,12 @@ function normalizeOptions(options) {
             throw new TypeError("enableKeybinds must be a boolean.");
         }
         normalized.enableKeybinds = options.enableKeybinds;
+    }
+    if (typeof options.snapAssist !== "undefined") {
+        if (typeof options.snapAssist !== "boolean") {
+            throw new TypeError("snapAssist must be a boolean.");
+        }
+        normalized.snapAssist = options.snapAssist;
     }
     return normalized;
 }
@@ -123,12 +138,18 @@ function generateDropin(state, options) {
         Array.prototype.push.apply(lines, KEYBIND_LINES);
     }
 
+    if (flags.snapAssist) {
+        lines.push("");
+        Array.prototype.push.apply(lines, SNAP_BIND_LINES);
+    }
+
     return lines.join("\n") + "\n";
 }
 
 if (typeof module !== "undefined" && module.exports) {
     module.exports = {
         KEYBIND_LINES: KEYBIND_LINES,
+        SNAP_BIND_LINES: SNAP_BIND_LINES,
         LAYOUT_FOR_MODE: LAYOUT_FOR_MODE,
         generateDropin: generateDropin
     };
