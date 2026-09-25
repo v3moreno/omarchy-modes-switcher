@@ -66,6 +66,13 @@ qs ipc -n -p "$OMARCHY_PATH/shell" call omarchy-modes.switcher setMode master
 qs ipc -n -p "$OMARCHY_PATH/shell" call omarchy-modes.switcher snapToggle
 ```
 
+A second target controls the menu itself:
+
+```
+qs ipc -n -p "$OMARCHY_PATH/shell" call omarchy-modes.switcher.widget open
+qs ipc -n -p "$OMARCHY_PATH/shell" call omarchy-modes.switcher.widget toggle
+```
+
 ## How it works
 
 - Choices are persisted to `~/.local/state/omarchy-modes/state.json`.

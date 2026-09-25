@@ -8,10 +8,16 @@ import qs.Ui
 import "engine/state.js" as State
 import "engine/dropin.js" as Dropin
 import "engine/snap.js" as Snap
+import "Model.js" as Model
 
-BarWidget {
+// The view is Model.build(snap, ui) — plain rows; this file draws them and
+// turns actions back into calls. ipcTarget adds open/close/toggle IPC on
+// "omarchy-modes.switcher.widget"; the custom handler below keeps the
+// mode/snap verbs on "omarchy-modes.switcher".
+Panel {
   id: root
   moduleName: "omarchy-modes.switcher"
+  ipcTarget: "omarchy-modes.switcher.widget"
 
   readonly property string stateDirectory: Quickshell.env("HOME") + "/.local/state/omarchy-modes"
   readonly property string statePath: stateDirectory + "/state.json"
@@ -26,8 +32,6 @@ BarWidget {
   property var modeState: State.defaultState()
   property bool stateLoaded: false
   property string stateError: ""
-  property bool menuOpen: false
-  property bool opened: false
   property bool applying: false
   property string applyPhase: "idle"
   property string applyError: ""
@@ -131,38 +135,28 @@ BarWidget {
     return fallbackModeForCurrentWorkspace()
   }
 
-  function modeLabel(mode) {
-    if (mode === "floating") return "Floating"
-    if (mode === "master") return "Master"
-    if (mode === "scrolling") return "Scrolling"
-    return "Dwindle"
-  }
+  function modeLabel(mode) { return Model.modeLabel(mode) }
+  function modeGlyph(mode) { return Model.modeGlyph(mode) }
 
-  function modeGlyph(mode) {
-    if (mode === "floating") return "󰉈"
-    if (mode === "master") return "󰕮"
-    if (mode === "scrolling") return "󰕰"
-    return "󰕭"
-  }
-
+  // Shadow Panel's open/close: opening refuses while a mode is being
+  // applied, resets the expanded picker, and lands the cursor on the
+  // current mode's row.
   function open() {
     if (applying) return
     snapExpanded = ""
-    // Item 0 is the LAYOUT header; modes follow it.
-    menuCursor = Math.max(0, modes.indexOf(currentMode)) + 1
-    menuOpen = true
-    opened = true
+    menuCursor = 0
+    for (var i = 0; i < menuModel.length; i++) {
+      if (menuModel[i].type === "mode" && menuModel[i].id === currentMode) {
+        menuCursor = i
+        break
+      }
+    }
+    controller.show()
   }
 
   function close() {
     snapExpanded = ""
-    menuOpen = false
-    opened = false
-  }
-
-  function toggle() {
-    if (menuOpen) close()
-    else open()
+    controller.hide()
   }
 
   function loadState(text) {
@@ -776,7 +770,7 @@ BarWidget {
     persistSnapFile()
     // Leave the cursor on the option row the choice belonged to.
     for (var i = 0; i < menuModel.length; i++) {
-      if (menuModel[i].kind === "option" && menuModel[i].id === item.opt) {
+      if (menuModel[i].type === "option" && menuModel[i].id === item.opt) {
         menuCursor = i
         break
       }
@@ -788,14 +782,21 @@ BarWidget {
   }
 
   // ---- menu model ----
-  // Aesthetic borrowed from sero.local-ai: one gutter, flat rows grouped under
-  // faint caps headers, a check for what is chosen, a chevron for what opens,
-  // values flush right. Rows in a group touch; groups sit a gap apart.
+  // The view is built by Model.js from a plain snapshot; rows are typed
+  // ("sec", "mode", "toggle", "option", "choice", "error") and carry a
+  // "verb|arg" action. What a type draws is a row component below.
   readonly property string menuFont: bar && bar.fontFamily ? bar.fontFamily : Style.font.family
-  readonly property color menuInk: Color.popups.text
-  readonly property color menuValue: Util.alpha(Color.popups.text, 0.72)
-  readonly property color menuLabel: Util.alpha(Color.popups.text, 0.48)
-  readonly property color menuSurface: Util.alpha(Color.popups.text, 0.07)
+  readonly property color theme: bar ? bar.foreground : Color.foreground
+  readonly property color bg: Color.popups.background
+  readonly property color menuSurface: Util.alpha(theme, 0.07)
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  // Tones are measured against the card surface (Model.tones), not guessed —
+  // labels stay readable on light and high-contrast themes alike.
+  readonly property var menuTones: Model.tones(theme, bg, menuSurface, urgent)
+  readonly property color menuInk: Qt.rgba(menuTones.ink.r, menuTones.ink.g, menuTones.ink.b, 1)
+  readonly property color menuValue: Qt.rgba(menuTones.value.r, menuTones.value.g, menuTones.value.b, 1)
+  readonly property color menuLabel: Qt.rgba(menuTones.label.r, menuTones.label.g, menuTones.label.b, 1)
+  readonly property color menuAlert: Qt.rgba(menuTones.alert.r, menuTones.alert.g, menuTones.alert.b, 1)
   readonly property int menuGutter: Style.space(18)
   readonly property int menuEdge: Style.space(8)
   readonly property int menuSlot: Style.space(18)
@@ -804,45 +805,27 @@ BarWidget {
   readonly property int menuGroupGap: Style.space(16)
   readonly property int menuTopPad: Style.space(10)
 
-  function menuItems() {
-    var items = [{ kind: "sec", label: "LAYOUT" }]
-    for (var i = 0; i < modes.length; i++) {
-      items.push({
-        kind: "mode", id: modes[i], label: modeLabel(modes[i]),
-        glyph: modeGlyph(modes[i]),
-        checked: currentMode === modes[i],
-        value: currentMode === modes[i] ? "✓" : ""
-      })
+  // The plain snapshot the view is built from
+  readonly property var snap: ({
+    mode: currentMode, snapEnabled: snapEnabled, snapColumns: snapColumns,
+    snapRows: snapRows, snapReach: snapReach,
+    applying: applying, problem: applyError
+  })
+  readonly property var view: {
+    try {
+      return Model.build(snap, { open: snapExpanded })
+    } catch (e) {
+      return { title: "MODES", mark: "error",
+        rows: [{ type: "error", label: String(e.message || e) }] }
     }
-    items.push({ kind: "sec", label: "SNAP" })
-    items.push({ kind: "toggle", id: "enabled", label: "enabled",
-      value: snapEnabled ? "on" : "off" })
-    items.push({ kind: "option", id: "columns", label: "columns",
-      value: snapColumns === 0 ? "auto" : String(snapColumns) })
-    if (snapExpanded === "columns") {
-      var colChoices = ["auto", "2", "3", "4"]
-      for (var c = 0; c < colChoices.length; c++) {
-        items.push({ kind: "choice", opt: "columns", id: colChoices[c],
-          label: colChoices[c],
-          checked: snapColumns === (c === 0 ? 0 : Number(colChoices[c])) })
-      }
-    }
-    items.push({ kind: "toggle", id: "rows", label: "rows",
-      value: snapRows ? "on" : "off" })
-    var reachNames = ["near", "normal", "far"]
-    items.push({ kind: "option", id: "reach", label: "reach",
-      value: reachNames[snapReach] })
-    if (snapExpanded === "reach") {
-      for (var r = 0; r < reachNames.length; r++) {
-        items.push({ kind: "choice", opt: "reach", id: reachNames[r],
-          label: reachNames[r], checked: snapReach === r })
-      }
-    }
-    return items
   }
-
-  readonly property var menuModel: menuItems()
+  readonly property var menuModel: view.rows
   onMenuModelChanged: menuCursor = Math.max(0, Math.min(menuModel.length - 1, menuCursor))
+
+  function rowIsActionable(row) {
+    return row && (row.type === "mode" || row.type === "toggle"
+      || row.type === "option" || row.type === "choice")
+  }
 
   function moveMenuCursor(dy) {
     var items = menuModel, i = menuCursor
@@ -850,22 +833,27 @@ BarWidget {
       var next = i + dy
       if (next < 0 || next >= items.length) break
       i = next
-      if (items[i].kind !== "sec") break
+      if (rowIsActionable(items[i])) break
     }
     menuCursor = i
   }
 
-  function activateMenuItem() {
-    var item = menuModel[menuCursor]
-    if (!item || item.kind === "sec") return
-    if (item.kind === "mode") startApply(item.id)
-    else if (item.kind === "toggle") toggleSnapSetting(item.id)
-    else if (item.kind === "option") snapExpanded = snapExpanded === item.id ? "" : item.id
-    else if (item.kind === "choice") chooseSnapOption(item)
+  // An action is "verb|arg...", from Model.js
+  function activate(action) {
+    var a = (action || "").split("|")
+    if (a[0] === "mode") startApply(a[1])
+    else if (a[0] === "snapToggle") toggleSnapSetting(a[1])
+    else if (a[0] === "pick") snapExpanded = snapExpanded === a[1] ? "" : a[1]
+    else if (a[0] === "choice") chooseSnapOption({ opt: a[1], id: a[2] })
   }
 
-  implicitWidth: triggerRow.implicitWidth
-  implicitHeight: triggerRow.implicitHeight
+  function activateMenuItem() {
+    var item = menuModel[menuCursor]
+    if (rowIsActionable(item)) activate(item.action)
+  }
+
+  implicitWidth: modeButton.implicitWidth
+  implicitHeight: modeButton.implicitHeight
 
   IpcHandler {
     target: "omarchy-modes.switcher"
@@ -897,28 +885,33 @@ BarWidget {
     }
   }
 
-  Row {
-    id: triggerRow
+  // The mark: the current mode's glyph — urgent on a failed apply, pulsing
+  // while one is in flight, lit otherwise.
+  BarIconButton {
+    id: modeButton
     anchors.fill: parent
-    spacing: Style.space(1)
-
-    BarIconButton {
-      id: modeButton
-      bar: root.bar
-      text: root.modeGlyph(root.currentMode)
-      tooltipText: root.currentModeLabel
-      active: root.menuOpen || root.applying
-      onPressed: root.toggle()
-    }
-
-    WidgetButton {
-      id: modeLabelButton
-      bar: root.bar
-      text: root.currentModeLabel + " 󰅂"
-      tooltipText: root.applyError !== "" ? root.applyError : root.currentModeLabel
-      horizontalMargin: Style.spaceReal(3)
-      active: root.menuOpen || root.applying
-      onPressed: root.toggle()
+    bar: root.bar
+    tooltipText: root.applyError !== "" ? root.applyError : root.currentModeLabel
+    active: root.opened || root.applying
+    onPressed: root.toggle()
+    iconComponent: Component {
+      Item {
+        Text {
+          id: glyph
+          anchors.centerIn: parent
+          text: root.modeGlyph(root.currentMode)
+          color: root.view.mark === "error" ? root.menuAlert : root.theme
+          font.family: root.menuFont
+          font.pixelSize: Style.font.body
+          SequentialAnimation on opacity {
+            running: root.view.mark === "busy"
+            loops: Animation.Infinite
+            NumberAnimation { to: 0.35; duration: 400 }
+            NumberAnimation { to: 1; duration: 400 }
+            onStopped: glyph.opacity = 1
+          }
+        }
+      }
     }
   }
 
@@ -927,7 +920,7 @@ BarWidget {
     anchorItem: modeButton
     owner: root
     bar: root.bar
-    open: root.menuOpen
+    open: root.opened
     focusTarget: menuKeys
     contentWidth: modeMenu.fittedContentWidth(Style.space(230))
     contentHeight: modeMenu.fittedContentHeight(menuRows.implicitHeight)
@@ -946,28 +939,68 @@ BarWidget {
         id: menuRows
         width: parent.width
         spacing: 0
-        topPadding: Style.space(4)
+        topPadding: Style.space(8)
         bottomPadding: root.menuTopPad
 
+        // The top line: the name and the current mode
+        Item {
+          width: parent.width
+          height: root.menuHeadH
+          Text {
+            id: menuHead
+            x: root.menuGutter
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.view.title || ""
+            color: root.menuLabel
+            font.family: root.menuFont
+            font.pixelSize: Style.font.caption
+          }
+          Text {
+            anchors.left: menuHead.right
+            anchors.leftMargin: Style.space(8)
+            anchors.baseline: menuHead.baseline
+            text: root.view.version || ""
+            color: Util.alpha(root.menuLabel, 0.55)
+            font.family: root.menuFont
+            font.pixelSize: Style.font.caption - 2
+          }
+        }
+
         Repeater {
-          model: root.menuModel
+          // keyed by position, so a refresh updates rows in place instead of rebuilding them (no flicker)
+          model: (root.menuModel || []).length
 
           Item {
-            required property var modelData
             required property int index
-            readonly property var item: modelData
-            readonly property bool isRow: item.kind !== "sec"
+            readonly property var item: (root.menuModel || [])[index] || ({ type: "" })
+            readonly property bool isRow: root.rowIsActionable(item)
+            readonly property bool isError: item.type === "error"
             readonly property bool cursor: isRow && root.menuCursor === index
             // A leading slot holds the mode glyph, or the check on choice rows.
-            readonly property bool hasSlot: item.kind === "mode" || item.kind === "choice"
+            readonly property bool hasSlot: item.type === "mode" || item.type === "choice"
             width: menuRows.width
             height: isRow ? root.menuRowH
+              : isError ? errText.implicitHeight + Style.space(8)
               : (index === 0 ? 0 : root.menuGroupGap) + root.menuHeadH
-            opacity: root.applying && item.kind === "mode" ? 0.55 : 1
+            opacity: root.applying && item.type === "mode" ? 0.55 : 1
+
+            // An apply failure, inline instead of a tooltip
+            Text {
+              id: errText
+              visible: parent.isError
+              x: root.menuGutter
+              width: parent.width - 2 * root.menuGutter
+              anchors.verticalCenter: parent.verticalCenter
+              text: parent.item.label
+              color: root.menuAlert
+              font.family: root.menuFont
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
 
             // Section header ("LAYOUT", "SNAP") — sits on its group's rows.
             Text {
-              visible: !parent.isRow
+              visible: !parent.isRow && !parent.isError
               x: root.menuGutter
               anchors.bottom: parent.bottom
               text: parent.item.label
@@ -990,10 +1023,10 @@ BarWidget {
               visible: parent.isRow && parent.hasSlot
               x: root.menuGutter
               anchors.verticalCenter: parent.verticalCenter
-              text: parent.item.kind === "mode"
+              text: parent.item.type === "mode"
                 ? parent.item.glyph
-                : (parent.item.checked ? "✓" : "")
-              color: parent.item.kind === "mode" ? root.menuValue : root.menuInk
+                : (parent.item.on ? "✓" : "")
+              color: parent.item.type === "mode" ? root.menuValue : root.menuInk
               font.family: root.menuFont
               font.pixelSize: Style.font.body
             }
@@ -1004,7 +1037,7 @@ BarWidget {
               width: parent.width - x - root.menuGutter - Style.space(64)
               anchors.verticalCenter: parent.verticalCenter
               text: parent.item.label
-              color: parent.item.kind === "choice" && !parent.item.checked
+              color: parent.item.type === "choice" && !parent.item.on
                 ? root.menuValue : root.menuInk
               font.family: root.menuFont
               font.pixelSize: Style.font.body
@@ -1016,10 +1049,10 @@ BarWidget {
               anchors.right: parent.right
               anchors.rightMargin: root.menuGutter
               anchors.verticalCenter: parent.verticalCenter
-              text: parent.item.kind === "option"
-                ? parent.item.value + (root.snapExpanded === parent.item.id ? "  ⌄" : "  ›")
-                : parent.item.value
-              color: parent.item.kind === "mode" ? root.menuInk : root.menuValue
+              text: parent.item.type === "option"
+                ? String(parent.item.value || "") + (parent.item.open ? "  ⌄" : "  ›")
+                : String(parent.item.value || "")
+              color: parent.item.type === "mode" ? root.menuInk : root.menuValue
               font.family: root.menuFont
               font.pixelSize: Style.font.body
             }
@@ -1029,7 +1062,7 @@ BarWidget {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              enabled: !(root.applying && parent.item.kind === "mode")
+              enabled: !(root.applying && parent.item.type === "mode")
               onEntered: root.menuCursor = parent.index
               onClicked: root.activateMenuItem()
             }
