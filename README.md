@@ -73,6 +73,9 @@ qs ipc -n -p "$OMARCHY_PATH/shell" call omarchy-modes.switcher.widget open
 qs ipc -n -p "$OMARCHY_PATH/shell" call omarchy-modes.switcher.widget toggle
 ```
 
+Inside the menu, `Up`/`Down` (or `j`/`k`) move, `Enter` activates, and
+`Left`/`Right` rotate the SNAP settings shown as `< value >` — `Esc` closes.
+
 ## How it works
 
 - Choices are persisted to `~/.local/state/omarchy-modes/state.json`.

@@ -84,7 +84,6 @@ Panel {
   property int snapColumns: 0
   property bool snapRows: true
   property int snapReach: 1
-  property string snapExpanded: ""
   readonly property var snapReachScales: [0.7, 1.0, 1.5]
   readonly property real snapReachScale: snapReachScales[Math.max(0, Math.min(2, snapReach))]
 
@@ -139,11 +138,9 @@ Panel {
   function modeGlyph(mode) { return Model.modeGlyph(mode) }
 
   // Shadow Panel's open/close: opening refuses while a mode is being
-  // applied, resets the expanded picker, and lands the cursor on the
-  // current mode's row.
+  // applied and lands the cursor on the current mode's row.
   function open() {
     if (applying) return
-    snapExpanded = ""
     menuCursor = 0
     for (var i = 0; i < menuModel.length; i++) {
       if (menuModel[i].type === "mode" && menuModel[i].id === currentMode) {
@@ -155,7 +152,6 @@ Panel {
   }
 
   function close() {
-    snapExpanded = ""
     controller.hide()
   }
 
@@ -752,29 +748,27 @@ Panel {
     return "toggled"
   }
 
-  // "rows" is the only toggle besides enabled; "columns"/"reach" are options
-  // set through chooseSnapOption.
-  function toggleSnapSetting(id) {
+  // Every snap setting is a rotary: dir +1/-1 steps through its values
+  // (binary settings flip either way).
+  function rotateSnap(id, dir) {
     if (id === "enabled") { toggleSnapAssist(); return }
-    if (id === "rows") { snapRows = !snapRows; persistSnapFile() }
+    if (id === "rows") { snapRows = !snapRows; persistSnapFile(); return }
+    if (id === "columns") {
+      var opts = [0, 2, 3, 4]
+      var i = opts.indexOf(snapColumns)
+      snapColumns = opts[((i < 0 ? 0 : i) + dir + opts.length) % opts.length]
+      persistSnapFile()
+      return
+    }
+    if (id === "reach") {
+      snapReach = ((snapReach + dir) % 3 + 3) % 3
+      persistSnapFile()
+    }
   }
 
-  function chooseSnapOption(item) {
-    if (item.opt === "columns") {
-      snapColumns = item.id === "auto" ? 0 : Number(item.id)
-    } else if (item.opt === "reach") {
-      snapReach = ({ near: 0, normal: 1, far: 2 })[item.id]
-      if (snapReach === undefined) snapReach = 1
-    }
-    snapExpanded = ""
-    persistSnapFile()
-    // Leave the cursor on the option row the choice belonged to.
-    for (var i = 0; i < menuModel.length; i++) {
-      if (menuModel[i].type === "option" && menuModel[i].id === item.opt) {
-        menuCursor = i
-        break
-      }
-    }
+  function rotateSnapAtCursor(dir) {
+    var item = menuModel[menuCursor]
+    if (item && item.type === "spin") rotateSnap(item.id, dir)
   }
 
   function snapFileLoaded(text) {
@@ -783,7 +777,7 @@ Panel {
 
   // ---- menu model ----
   // The view is built by Model.js from a plain snapshot; rows are typed
-  // ("sec", "mode", "toggle", "option", "choice", "error") and carry a
+  // ("sec", "mode", "spin", "error") and carry a
   // "verb|arg" action. What a type draws is a row component below.
   readonly property string menuFont: bar && bar.fontFamily ? bar.fontFamily : Style.font.family
   readonly property color theme: bar ? bar.foreground : Color.foreground
@@ -813,7 +807,7 @@ Panel {
   })
   readonly property var view: {
     try {
-      return Model.build(snap, { open: snapExpanded })
+      return Model.build(snap)
     } catch (e) {
       return { title: "MODES", mark: "error",
         rows: [{ type: "error", label: String(e.message || e) }] }
@@ -823,8 +817,7 @@ Panel {
   onMenuModelChanged: menuCursor = Math.max(0, Math.min(menuModel.length - 1, menuCursor))
 
   function rowIsActionable(row) {
-    return row && (row.type === "mode" || row.type === "toggle"
-      || row.type === "option" || row.type === "choice")
+    return row && (row.type === "mode" || row.type === "spin")
   }
 
   function moveMenuCursor(dy) {
@@ -842,9 +835,7 @@ Panel {
   function activate(action) {
     var a = (action || "").split("|")
     if (a[0] === "mode") startApply(a[1])
-    else if (a[0] === "snapToggle") toggleSnapSetting(a[1])
-    else if (a[0] === "pick") snapExpanded = snapExpanded === a[1] ? "" : a[1]
-    else if (a[0] === "choice") chooseSnapOption({ opt: a[1], id: a[2] })
+    else if (a[0] === "spin") rotateSnap(a[1], 1)
   }
 
   function activateMenuItem() {
@@ -928,12 +919,12 @@ Panel {
     PanelKeyCatcher {
       id: menuKeys
       anchors.fill: parent
-      onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveMenuCursor(dy) }
-      onActivateRequested: root.activateMenuItem()
-      onCloseRequested: {
-        if (root.snapExpanded !== "") root.snapExpanded = ""
-        else root.close()
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0) root.moveMenuCursor(dy)
+        else if (dx !== 0) root.rotateSnapAtCursor(dx)
       }
+      onActivateRequested: root.activateMenuItem()
+      onCloseRequested: root.close()
 
       Column {
         id: menuRows
@@ -942,7 +933,7 @@ Panel {
         topPadding: Style.space(8)
         bottomPadding: root.menuTopPad
 
-        // The top line: the name and the current mode
+        // The top line: the name and the current mode, styled like a section header
         Item {
           width: parent.width
           height: root.menuHeadH
@@ -954,6 +945,7 @@ Panel {
             color: root.menuLabel
             font.family: root.menuFont
             font.pixelSize: Style.font.caption
+            font.bold: true
           }
           Text {
             anchors.left: menuHead.right
@@ -976,8 +968,8 @@ Panel {
             readonly property bool isRow: root.rowIsActionable(item)
             readonly property bool isError: item.type === "error"
             readonly property bool cursor: isRow && root.menuCursor === index
-            // A leading slot holds the mode glyph, or the check on choice rows.
-            readonly property bool hasSlot: item.type === "mode" || item.type === "choice"
+            // A leading slot holds the mode glyph.
+            readonly property bool hasSlot: item.type === "mode"
             width: menuRows.width
             height: isRow ? root.menuRowH
               : isError ? errText.implicitHeight + Style.space(8)
@@ -1023,10 +1015,8 @@ Panel {
               visible: parent.isRow && parent.hasSlot
               x: root.menuGutter
               anchors.verticalCenter: parent.verticalCenter
-              text: parent.item.type === "mode"
-                ? parent.item.glyph
-                : (parent.item.on ? "✓" : "")
-              color: parent.item.type === "mode" ? root.menuValue : root.menuInk
+              text: parent.item.glyph || ""
+              color: root.menuValue
               font.family: root.menuFont
               font.pixelSize: Style.font.body
             }
@@ -1037,8 +1027,7 @@ Panel {
               width: parent.width - x - root.menuGutter - Style.space(64)
               anchors.verticalCenter: parent.verticalCenter
               text: parent.item.label
-              color: parent.item.type === "choice" && !parent.item.on
-                ? root.menuValue : root.menuInk
+              color: root.menuInk
               font.family: root.menuFont
               font.pixelSize: Style.font.body
               elide: Text.ElideRight
@@ -1049,8 +1038,9 @@ Panel {
               anchors.right: parent.right
               anchors.rightMargin: root.menuGutter
               anchors.verticalCenter: parent.verticalCenter
-              text: parent.item.type === "option"
-                ? String(parent.item.value || "") + (parent.item.open ? "  ⌄" : "  ›")
+              // spins read "< value >"; the mode check is a bare ✓
+              text: parent.item.type === "spin"
+                ? "< " + String(parent.item.value || "") + " >"
                 : String(parent.item.value || "")
               color: parent.item.type === "mode" ? root.menuInk : root.menuValue
               font.family: root.menuFont

@@ -52,41 +52,26 @@ function modeGlyph(m) { return GLYPHS[m] || "󰕭" }
 // the bar mark: a failed apply reads urgent, an in-flight one busy, otherwise ready
 function mark(s) { return s.problem ? "error" : s.applying ? "busy" : "ready" }
 
-function build(s, ui) {
+// A snap setting shown as "< value >"; Enter/click steps forward, Left/Right steps.
+function spin(id, value) {
+  return { type: "spin", id: id, label: id, value: value, action: "spin|" + id }
+}
+
+function build(s) {
   s = s || {}
-  ui = ui || {}
   var rows = []
   if (s.problem) rows.push({ type: "error", label: s.problem })
 
-  rows.push({ type: "sec", label: "LAYOUT" })
   MODES.forEach(function(m) {
     rows.push({ type: "mode", id: m, label: modeLabel(m), glyph: modeGlyph(m),
       on: s.mode === m, value: s.mode === m ? "✓" : "", action: "mode|" + m })
   })
 
   rows.push({ type: "sec", label: "SNAP" })
-  rows.push({ type: "toggle", id: "enabled", label: "enabled",
-    value: s.snapEnabled ? "on" : "off", action: "snapToggle|enabled" })
-  rows.push({ type: "option", id: "columns", label: "columns",
-    value: s.snapColumns === 0 ? "auto" : String(s.snapColumns),
-    open: ui.open === "columns", action: "pick|columns" })
-  if (ui.open === "columns") {
-    var cols = ["auto", "2", "3", "4"]
-    cols.forEach(function(v, i) {
-      rows.push({ type: "choice", opt: "columns", id: v, label: v,
-        on: s.snapColumns === (i === 0 ? 0 : Number(v)), action: "choice|columns|" + v })
-    })
-  }
-  rows.push({ type: "toggle", id: "rows", label: "rows",
-    value: s.snapRows !== false ? "on" : "off", action: "snapToggle|rows" })
+  rows.push(spin("enabled", s.snapEnabled ? "on" : "off"))
+  rows.push(spin("columns", s.snapColumns === 0 ? "auto" : String(s.snapColumns)))
+  rows.push(spin("rows", s.snapRows !== false ? "on" : "off"))
   var reach = s.snapReach === 0 || s.snapReach === 2 ? s.snapReach : 1
-  rows.push({ type: "option", id: "reach", label: "reach", value: REACH_NAMES[reach],
-    open: ui.open === "reach", action: "pick|reach" })
-  if (ui.open === "reach") {
-    REACH_NAMES.forEach(function(v, i) {
-      rows.push({ type: "choice", opt: "reach", id: v, label: v,
-        on: reach === i, action: "choice|reach|" + v })
-    })
-  }
+  rows.push(spin("reach", REACH_NAMES[reach]))
   return { title: "MODES", version: modeLabel(s.mode), rows: rows, mark: mark(s) }
 }
