@@ -21,8 +21,6 @@ An optional Windows-style snap assist, configured from the **SNAP** section at t
 
 When enabled, `SUPER + drag` a window (Omarchy's native move) toward a screen edge and a cue shows the exact snap it will take; release to land it:
 
-![Snap cue overlay](preview-snap.png)
-
 - **Side edges** → left/right column, full height (the default is a single row of 2 columns).
 - **Top/bottom edges** → that column's **upper/lower row** (half height — up to 2 rows within each column).
 - **Ultrawides** (~21:9, 34″): the middle stretch of the top/bottom edges instead offers the full **middle column**; super-ultrawide (~32:9, 49″) offers a wider middle spanning two of four columns.
