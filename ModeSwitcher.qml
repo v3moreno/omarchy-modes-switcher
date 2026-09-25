@@ -946,7 +946,7 @@ BarWidget {
         id: menuRows
         width: parent.width
         spacing: 0
-        topPadding: root.menuTopPad
+        topPadding: Style.space(4)
         bottomPadding: root.menuTopPad
 
         Repeater {
@@ -962,7 +962,7 @@ BarWidget {
             readonly property bool hasSlot: item.kind === "mode" || item.kind === "choice"
             width: menuRows.width
             height: isRow ? root.menuRowH
-              : (index === 0 ? root.menuTopPad : root.menuGroupGap) + root.menuHeadH
+              : (index === 0 ? 0 : root.menuGroupGap) + root.menuHeadH
             opacity: root.applying && item.kind === "mode" ? 0.55 : 1
 
             // Section header ("LAYOUT", "SNAP") — sits on its group's rows.
