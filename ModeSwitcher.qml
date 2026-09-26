@@ -44,6 +44,8 @@ Panel {
   property int menuCursor: 0
   property bool dropinReady: false
   property bool dropinNeedsReload: false
+  property bool dropinVerifyPending: false
+  property bool dropinVerifyDone: false
   property string dropinExisting: ""
 
   // Snap assist: non-consuming SUPER+drag press/release binds land on the
@@ -177,10 +179,21 @@ Panel {
       console.warn("omarchy-modes.switcher: could not generate drop-in: " + error.message)
       return
     }
-    if (expected === dropinExisting) return
+    if (expected === dropinExisting) {
+      // File already matched — but if the last reload died in the startup
+      // storm its rules were never evaluated. Verify once per session.
+      if (expected !== "" && !dropinVerifyDone) {
+        dropinVerifyDone = true
+        dropinVerifyTimer.restart()
+      }
+      return
+    }
     // Nothing to emit yet — leave the file absent rather than write a stub.
     if (Object.keys(modeState.modes).length === 0 && !snapEnabled) return
     dropinNeedsReload = true
+    // The write usually lands while Hyprland is still coming up, when the
+    // detached reload can be silently lost — verify the rules went live.
+    dropinVerifyPending = true
     // Track the write synchronously — dropinExisting updates via async
     // reloads and a fast toggle-off/on would otherwise skip a needed write.
     dropinExisting = expected
@@ -191,7 +204,9 @@ Panel {
     applying = false
     applyPhase = "failed"
     applyError = String(message || "Mode change failed.")
+    console.warn("omarchy-modes.switcher: apply failed: " + applyError)
     hyprctlWatchdog.stop()
+    applyWatchdog.stop()
     hyprctlContinuation = null
   }
 
@@ -237,6 +252,7 @@ Panel {
     applying = true
     applyError = ""
     applyingWorkspaceId = workspaceId
+    applyWatchdog.restart()
     close()
     applyPhase = "ensuring-directories"
     ensureDirectories.command = ["mkdir", "-p", stateDirectory, dropinDirectory]
@@ -247,6 +263,7 @@ Panel {
   function writeState() {
     try {
       applyPhase = "writing-state"
+      applyWatchdog.restart()
       stateFile.setText(State.writeState(pendingState))
     } catch (error) {
       failApply("Could not write state.json: " + error.message)
@@ -259,6 +276,7 @@ Panel {
       // vocabulary and rejects anything else before serialisation.
       State.validateState(pendingState)
       applyPhase = "writing-dropin"
+      applyWatchdog.restart()
       var dropinText = Dropin.generateDropin(pendingState, dropinFlags())
       root.dropinExisting = dropinText
       dropinFile.setText(dropinText)
@@ -277,6 +295,7 @@ Panel {
     hyprctlProcess.command = ["hyprctl"].concat(args)
     hyprctlProcess.running = true
     hyprctlWatchdog.restart()
+    applyWatchdog.restart()
   }
 
   function parseJson(text, description) {
@@ -363,6 +382,7 @@ Panel {
       modeState = pendingState
       applying = false
       applyPhase = "idle"
+      applyWatchdog.stop()
       return
     }
     startHyprctl(["-j", "clients"], "-j clients", checkCurrentSweepWindow)
@@ -1097,6 +1117,10 @@ Panel {
         root.dropinNeedsReload = false
         Quickshell.execDetached(["hyprctl", "reload"])
       }
+      if (root.dropinVerifyPending) {
+        root.dropinVerifyPending = false
+        dropinVerifyTimer.restart()
+      }
       if (root.applying && root.applyPhase === "writing-dropin") {
         root.applyPhase = "reloading"
         root.startHyprctl(["reload"], "reload", function() {
@@ -1170,6 +1194,33 @@ Panel {
       hyprctlProcess.signal(9)
       root.failApply("hyprctl " + root.hyprctlDescription + " did not answer within "
         + root.hyprctlTimeoutMs + "ms; Hyprland IPC may be wedged.")
+    }
+  }
+
+  // Whole-apply watchdog: a dropped FileView/continuation step wedges `applying`
+  // with no process running — without this the icon pulses forever and every
+  // mode verb answers "busy" until a shell restart.
+  Timer {
+    id: applyWatchdog
+    interval: 15000
+    repeat: false
+    onTriggered: if (root.applying) root.failApply("Mode change timed out at "
+      + root.applyPhase + ".")
+  }
+
+  // A detached `hyprctl reload` issued while Hyprland is still coming up can
+  // be silently lost — the drop-in exists on disk but its rules never went
+  // live (that is exactly what strands a restored floating workspace tiled).
+  // The reload in onSaved covers the common case; this delayed reload is the
+  // safety net for the startup race. Cheap and idempotent.
+  Timer {
+    id: dropinVerifyTimer
+    interval: 4000
+    repeat: false
+    onTriggered: {
+      if (!root.dropinReady) return
+      console.warn("omarchy-modes.switcher: verifying drop-in load with a delayed reload")
+      Quickshell.execDetached(["hyprctl", "reload"])
     }
   }
 

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "omarchy-modes.switcher",
   "name": "Omarchy Modes Switcher",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Victor Moreno",
   "license": "MIT",
   "description": "Per-workspace layout modes for Hyprland. Switch a workspace between floating, dwindle, master, and scrolling from the bar.",
